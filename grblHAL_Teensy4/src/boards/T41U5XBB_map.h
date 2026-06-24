@@ -40,7 +40,7 @@
 #define Y_STEP_PIN          (4u)
 #define Y_DIRECTION_PIN     (5u)
 #define Y_ENABLE_PIN        (40u)
-#define Y_LIMIT_PIN         (21u)
+#define Y_LIMIT_PIN         (23u)
 
 #define Z_STEP_PIN          (6u)
 #define Z_DIRECTION_PIN     (7u)
@@ -52,7 +52,7 @@
 #define M3_AVAILABLE
 #define M3_STEP_PIN         (8u)
 #define M3_DIRECTION_PIN    (9u)
-#define M3_LIMIT_PIN        (23u)
+#define M3_LIMIT_PIN        (21u)
 #define M3_ENABLE_PIN       (38u)
 #endif
 

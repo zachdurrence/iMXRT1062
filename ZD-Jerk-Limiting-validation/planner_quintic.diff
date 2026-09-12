@@ -1,0 +1,103 @@
+--- /mnt/user-data/uploads/iMXRT1062/grblHAL_Teensy4/src/grbl/planner.c	2026-09-12 19:25:36.742504635 +0000
++++ work/planner.c	2026-09-12 19:42:36.566467336 +0000
+@@ -567,22 +567,85 @@
+ 
+ #if ENABLE_JERK_ACCELERATION
+ 
+-    // Calculate effective acceleration over block. Since jerk acceleration takes longer to execute due to ramp up and 
+-    // ramp down of the acceleration at the start and end of a ramp we need to adjust the acceleration value the planner 
+-    // uses so it still calculates reasonable entry speeds, exit speeds and times to decelerate/accelerate. 
+-    // 2 general cases emerge: 
+-    //     -slow speed regime: incomplete jerk ramp (max_acceleration is not reached)
+-    //     -high speed regime: complete jerk ramp + time at max_axcel to reach desired programmed_rates
+-    // Profiles are calculated as symmetrical (calculate to 1/2 programmed rate, then double)
++    /* Calculate effective acceleration over block.
++       ------------------------------------------------------------------------
++       The planner plans every block as a trapezoid using a single scalar
++       `acceleration`, so a jerk-limited profile can only be accommodated by
++       handing the planner the AVERAGE slope of the real ramp. The planner's
++       distance budgets (accelerate_until, decelerate_after, intersect_distance,
++       junction entry speeds) then come out correct in DISTANCE and TIME, and
++       the stepper is free to shape the velocity inside that budget.
++
++       For the quintic ("smootherstep") ramp used by st_prep_buffer():
++
++           v(tau) = v0 + dv * (6*tau^5 - 15*tau^4 + 10*tau^3),  tau = t/T
++
++       the integral of the basis polynomial over [0,1] is exactly 1/2, so the
++       ramp's mean velocity is exactly (v0 + v1)/2 -- identical to a linear
++       ramp of the same duration. That is what makes this substitution legal:
++       a quintic ramp and a straight-line ramp covering the same distance take
++       the SAME time T = 2*S/(v0+v1). Only the derivatives differ:
++
++           peak accel = (15/8)   * dv/T    = 1.875   * a_eff
++           peak jerk  = (10/V3)  * dv/T^2  = 5.77350 * a_eff^2/dv
++
++       (both exact; d/dtau of the basis is 30*tau^2*(tau-1)^2, peaking at
++       tau = 0.5, and its second derivative peaks at tau = (3 -/+ V3)/6.)
++
++       Inverting those two expressions against the axis-limited acceleration
++       and jerk gives two simultaneous ceilings on a_eff, and the binding one
++       wins. Using dv ~ programmed_rate follows the same symmetrical
++       full-ramp-from-rest convention the previous implementation used:
++
++           a_eff <= max_acceleration * 8/15
++           a_eff <= sqrt(jerk * programmed_rate / (10/V3))
++
++       The first dominates at high feed rate (long ramps, jerk is cheap), the
++       second at low feed rate (short ramps, where an accel-limited quintic
++       would demand unbounded jerk). Both are closed form -- no iteration and
++       no regime test, unlike the trapezoidal-jerk profile this replaces.
++
++       For reference, the trapezoidal-jerk formula previously used here derated
++       by a factor that ran from 2.0 (pure double-jerk ramp, no constant-accel
++       plateau) down to 1.0 (long plateau, jerk fillets negligible). The
++       quintic's 1.875 sits inside that range, so effective acceleration on an
++       already-tuned machine changes only modestly: slightly lower at high feed
++       rates, slightly higher at low feed rates.
++     */
+     if(block->condition.jerk) {
+-        float time_to_max_accel = block->max_acceleration / block->jerk;    // unit: min - time it takes to reach max acceleration
+-        float speed_after_jerkramp = 0.5f * block->jerk * time_to_max_accel * time_to_max_accel;   // unit: mm / min - velocity after one completed jerk ramp up - Vt = V0 + A0T + 1/2 jerk*T
+-        if(0.5f * block->programmed_rate > speed_after_jerkramp)
+-            // Profile time = 2x (1 complete jerk ramp + additional time at max_accel to reach desired speed)
+-            block->acceleration = block->programmed_rate / (2.0f * (time_to_max_accel + (0.5f * block->programmed_rate - speed_after_jerkramp) / block->max_acceleration));
+-        else
+-            // Max Accel is not reached. time_to_halfvelocity = sqrt(0.5 * programmed_rate * 2 / jerk) -> derived from Vt = V0 + A0T + 1/2 jerk*T (v0 and a0t == 0 in this case)
+-            block->acceleration = block->programmed_rate / (2.0f * sqrt(block->programmed_rate / block->jerk));
++        // Acceleration-limited ceiling: peak accel = (15/8) * a_eff.
++        block->acceleration = block->max_acceleration * (8.0f / 15.0f);
++        // Jerk-limited ceiling: peak jerk = (10/sqrt(3)) * a_eff^2 / dv.
++        float accel_jerk_limited = sqrtf(block->jerk * block->programmed_rate * (1.0f / 5.7735026919f));
++        if(accel_jerk_limited < block->acceleration)
++            block->acceleration = accel_jerk_limited;
++
++        /* KNOWN GAP -- short moves that never reach programmed_rate.
++           ------------------------------------------------------------------
++           The jerk ceiling above assumes the ramp spans dv ~ programmed_rate.
++           Peak jerk goes as a_eff^2/dv, so a block whose actual speed change is
++           smaller than programmed_rate exceeds the jerk setting by
++           programmed_rate/dv. Measured on the segment simulator: a 3 mm
++           triangle at F3000 runs about 7.8x the jerk setting, a 0.05 mm move
++           about 16x. (The quantized-jerk implementation this replaces had the
++           same exposure and was considerably worse in absolute terms, so this
++           is not a regression -- but it is not closed either.)
++
++           Closing it exactly requires bounding a_eff by the block's own length.
++           For a symmetric triangle over length L the peak speed is
++           sqrt(a_eff*L), giving peak jerk = (10/sqrt 3) * a_eff^1.5 / sqrt(L),
++           hence:
++
++               block->acceleration = min(block->acceleration,
++                   powf(block->jerk * sqrtf(block->millimeters) * (1.0f / 5.7735026919f), 2.0f / 3.0f));
++
++           Do NOT enable that unconditionally without testing. It is correct for
++           an isolated short move, but it also clamps a_eff for every short block
++           in a long chain (arc segmentation, 3D contour toolpaths) where the
++           blocks cruise through and never ramp at all. The planner uses
++           `acceleration` for junction entry-speed limits (entry_speed_sqr <=
++           2*a*mm), so applying it there would collapse arc feed rates.
++         */
+     }
+ 
+ #endif // ENABLE_JERK_ACCELERATION

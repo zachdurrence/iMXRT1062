@@ -1,0 +1,362 @@
+--- /mnt/user-data/uploads/iMXRT1062/grblHAL_Teensy4/src/grbl/stepper.c	2026-09-12 19:25:37.206504618 +0000
++++ work/stepper.c	2026-09-12 19:36:33.046480631 +0000
+@@ -102,9 +102,16 @@
+     prep_flags_t recalculate;
+     ramp_type_t ramp_type;      // Current segment ramp state
+ #if ENABLE_JERK_ACCELERATION
+-    bool jerk;
+-    float last_accel;     // Acceleration of last computed segment.
+-    float last_time_var;  // Duration of last normal segment for final segment continuity.
++    bool jerk;              // Jerk-limited (quintic) ramps enabled for this block.
++    // State of the quintic ramp currently being executed. Armed once per ramp
++    // (accel, decel, or override-decel) and then advanced by normalized time.
++    float ramp_t;           // Total duration of the ramp (min). 0.0 == ramp not armed.
++    float ramp_tau;         // Normalized progress through the ramp, 0.0 -> 1.0.
++    float ramp_v0;          // Speed at ramp start (mm/min).
++    float ramp_v1;          // Speed at ramp end (mm/min).
++    float ramp_mm;          // Distance spanned by the ramp (mm).
++    float ramp_end;         // mm_remaining at ramp end, measured from end of block (mm).
++    float ramp_inv_vsum;    // 1.0 / (ramp_v0 + ramp_v1), precomputed.
+ #endif
+     float dt_remainder;
+     uint32_t steps_remaining;
+@@ -183,6 +190,134 @@
+ 
+ extern void gc_output_message (char *message);
+ 
++#if ENABLE_JERK_ACCELERATION
++
++/*  QUINTIC (S-CURVE) JERK-LIMITED RAMP
++    ---------------------------------------------------------------------------
++    Replaces the per-segment quantized jerk integration previously used here
++    (accumulate `last_accel` by jerk*dt each DT_SEGMENT tick, then guess when to
++    start ramping acceleration back down from a lookahead distance estimate).
++    That scheme had two structural problems, both removed by this one:
++
++      1. Acceleration was a staircase held constant for one segment and then
++         stepped, so the commanded jerk was a train of impulses at
++         ACCELERATION_TICKS_PER_SECOND rather than a bounded value. Shrinking
++         DT_SEGMENT reduced the step height but raised its frequency.
++
++      2. The ramp's terminal segment duration was recovered from the
++         trapezoidal identity time_var = 2*d/(v0 + v1). As exit_speed -> 0 that
++         denominator collapses and time_var blows up by orders of magnitude,
++         producing an erroneously long final segment (grblHAL discussion #384).
++
++    A quintic Bezier with control points P0=P1=P2=v0 and P3=P4=P5=v1 pins both
++    acceleration and jerk to zero at each end of the ramp and collapses exactly
++    to the smootherstep basis:
++
++        v(tau) = v0 + dv * P(tau),   P(tau) = 6*tau^5 - 15*tau^4 + 10*tau^3
++        s(tau) = S  * Snorm(tau),    Snorm   = (2*v0*tau + dv*Q(tau)) / (v0+v1)
++                                     Q(tau)  = tau^4 * (2*tau^2 - 6*tau + 5)
++
++    Because the integral of P over [0,1] is exactly 1/2, the ramp's mean
++    velocity is exactly (v0+v1)/2. The ramp therefore covers the planner's
++    trapezoidal distance budget S in exactly the trapezoidal duration
++
++        T = 2*S / (v0 + v1)
++
++    which is the same expression the linear path already uses at ramp
++    junctions. This is what lets the quintic drop into the existing
++    distance-budgeted profile without any geometric correction: the planner's
++    accelerate_until / decelerate_after / mm_complete boundaries are met
++    exactly, and the target speed is reached at exactly the same instant the
++    boundary is reached -- both are snapped, not approached.
++
++    The cost is in the derivatives. Peak acceleration is 15/8 = 1.875 times the
++    ramp's mean slope and peak jerk is (10/sqrt 3) * dv/T^2, so planner.c must
++    hand us an `acceleration` derated to keep both inside the axis limits --
++    see the a_eff derivation in plan_buffer_line(). Nothing here re-checks
++    those limits; honouring them is entirely a planner-side responsibility.
++
++    Terminal-segment stability falls out for free. time_var at ramp end is
++    (1 - tau)*T, drawn from the ramp's own duration which was fixed at ramp
++    start from the cruise speed. It never involves a division by a sum of
++    speeds that are both approaching zero, so the exit_speed -> 0 blowup and
++    the `last_time_var` continuity workaround are both gone.
++
++    Distance is evaluated ABSOLUTELY (mm_remaining = ramp_end + S*(1 - Snorm))
++    rather than by accumulating per-segment increments. Accumulating d1 - d0
++    differences of two large nearly-equal distances loses precision at small
++    DT_SEGMENT and lets rounding error walk the endpoint; the absolute form
++    cannot drift and lands on ramp_end bit-exactly.
++
++    NOTE: this shapes only the scalar "distance along block" clock. Per-axis
++    step distribution comes from st_prep_block->steps.value[idx] and
++    step_event_count, fixed once per block at load time and consumed by the
++    Bresenham DDA in the ISR. Multi-axis lockstep is therefore independent of
++    the velocity profile and unaffected by this change.
++*/
++
++// Advance the quintic ramp toward target_speed, ending at ramp_end mm from the
++// end of the block. Arms the ramp from the current state if not already armed.
++// Updates *mm_remaining, prep.current_speed, and -- on completion -- clamps
++// *time_var to the time actually consumed.
++// Returns true when the ramp has completed.
++static bool jerk_ramp_advance (float *mm_remaining, float *time_var, float ramp_end, float target_speed)
++{
++    if(prep.ramp_t == 0.0f) { // Arm a new ramp from the current state.
++
++        prep.ramp_v0 = prep.current_speed;
++        prep.ramp_v1 = target_speed;
++        prep.ramp_mm = *mm_remaining - ramp_end;
++        prep.ramp_end = ramp_end;
++        prep.ramp_tau = 0.0f;
++
++        float vsum = prep.ramp_v0 + prep.ramp_v1;
++
++        if(prep.ramp_mm > 0.0f && vsum > 0.0f) {
++            prep.ramp_inv_vsum = 1.0f / vsum;
++            prep.ramp_t = 2.0f * prep.ramp_mm * prep.ramp_inv_vsum;
++        } else {
++            // Degenerate ramp: no distance left to cover, or no speed to cover it
++            // with. Complete immediately without consuming segment time so the
++            // caller's do-while loop moves on to the next ramp state.
++            *mm_remaining = ramp_end;
++            *time_var = 0.0f;
++            prep.current_speed = target_speed;
++
++            return true;
++        }
++    }
++
++    float tau = prep.ramp_tau + *time_var / prep.ramp_t;
++
++    if(tau < 1.0f) { // Mid-ramp.
++
++        float dv = prep.ramp_v1 - prep.ramp_v0;
++        float tau2 = tau * tau;
++        float tau4 = tau2 * tau2;
++
++        // Fraction of the ramp distance covered at tau.
++        float snorm = (2.0f * prep.ramp_v0 * tau + dv * tau4 * (2.0f * tau2 - 6.0f * tau + 5.0f)) * prep.ramp_inv_vsum;
++
++        *mm_remaining = prep.ramp_end + prep.ramp_mm * (1.0f - snorm);
++        prep.current_speed = prep.ramp_v0 + dv * tau2 * tau * (10.0f - tau * (15.0f - 6.0f * tau));
++        prep.ramp_tau = tau;
++
++        return false;
++    }
++
++    // End of ramp. Distance budget and target speed are reached simultaneously
++    // by construction, so snap both. time_var comes from the ramp's own
++    // remaining duration -- well conditioned even as target_speed -> 0.
++    *time_var = (1.0f - prep.ramp_tau) * prep.ramp_t;
++    *mm_remaining = prep.ramp_end;
++    prep.current_speed = target_speed;
++    prep.ramp_t = 0.0f; // Disarm so the next ramp re-arms from the new state.
++
++    return true;
++}
++
++#endif // ENABLE_JERK_ACCELERATION
++
+ /*    BLOCK VELOCITY PROFILE DEFINITION
+           __________________________
+          /|                        |\     _________________         ^
+@@ -964,8 +1099,7 @@
+                 prep.req_mm_increment = REQ_MM_INCREMENT_SCALAR / prep.steps_per_mm;
+                 prep.dt_remainder = prep.target_position = 0.0f; // Reset for new segment block
+ #if ENABLE_JERK_ACCELERATION
+-    prep.jerk = pl_block->condition.jerk;
+-    prep.last_time_var = DT_SEGMENT; // Safe default for first segment's fallthrough.
++                prep.jerk = pl_block->condition.jerk;
+ #endif
+ #ifdef KINEMATICS_API
+                 prep.rate_multiplier = pl_block->rate_multiplier;
+@@ -996,6 +1130,17 @@
+             prep.mm_complete = 0.0f; // Default velocity profile complete at 0.0mm from end of block.
+             float inv_2_accel = 0.5f / pl_block->acceleration;
+ 
++#if ENABLE_JERK_ACCELERATION
++            // Disarm any in-flight quintic ramp. This block runs both on a new
++            // planner block and on a mid-block velocity profile recalculation
++            // (feed/rapid override change, feed hold, replan), all of which move
++            // the ramp's endpoints out from under it. The ramp is re-armed on the
++            // next segment from the *current* speed and the *new* distance budget,
++            // so the restart is velocity continuous; acceleration restarts from
++            // zero, which is slightly slower but never exceeds a limit.
++            prep.ramp_t = 0.0f;
++#endif
++
+             if (sys.step_control.execute_hold) { // [Forced Deceleration to Zero Velocity]
+                 // Compute velocity profile parameters for a feed hold in-progress. This profile overrides
+                 // the planner block profile, enforcing a deceleration to zero speed.
+@@ -1128,6 +1273,16 @@
+             switch (prep.ramp_type) {
+ 
+                 case Ramp_DecelOverride:
++#if ENABLE_JERK_ACCELERATION
++                    // Structurally identical to Ramp_Accel: ramp current_speed to
++                    // maximum_speed, ending at accelerate_until. Only the sign of dv
++                    // differs, and the quintic is symmetric in that.
++                    if(prep.jerk) {
++                        if(jerk_ramp_advance(&mm_remaining, &time_var, prep.accelerate_until, prep.maximum_speed))
++                            prep.ramp_type = mm_remaining == prep.decelerate_after ? Ramp_Decel : Ramp_Cruise;
++                        break;
++                    }
++#endif
+                     speed_var = pl_block->acceleration * time_var;
+                     if ((prep.current_speed - prep.maximum_speed) <= speed_var) {
+                         // Cruise or cruise-deceleration types only for deceleration override.
+@@ -1139,45 +1294,32 @@
+                         mm_remaining -= time_var * (prep.current_speed - 0.5f * speed_var);
+                         prep.current_speed -= speed_var;
+                     }
+-#if ENABLE_JERK_ACCELERATION
+-                    prep.last_accel = 0.0f;  // reset acceleration variable to 0 for next accel ramp
+-#endif
+                     break;
+ 
+                 case Ramp_Accel:
+                     // NOTE: Acceleration ramp only computes during first do-while loop.
+ #if ENABLE_JERK_ACCELERATION
+                     if(prep.jerk) {
+-                        float accel_var = pl_block->jerk * time_var; // Delta acceleration
+-                        float time_to_jerk = prep.last_accel / pl_block->jerk;
+-                        //Distance to 0 acceleration at speed (mm == V(0)*T + 1/2 A0*T^2 + 1/6 J*T^3)
+-                        float jerk_rampdown = time_to_jerk * (prep.current_speed +
+-                                                              (0.5f * prep.last_accel * time_to_jerk) +
+-                                                                pl_block->jerk * time_to_jerk * time_to_jerk * (1.0f / 6.0f));
+ #ifdef JERK_LOG
+-                        jlog.data[jlog.idx].s0 = mm_remaining - prep.accelerate_until;
++                        jlog.data[jlog.idx].s0 = prep.ramp_mm - (mm_remaining - prep.accelerate_until);
+                         jlog.data[jlog.idx].v0 = prep.current_speed;
+-                        jlog.data[jlog.idx].a0 = prep.last_accel;
+-                        jlog.data[jlog.idx].da = jlog.idx == 0 ? prep.last_accel : (prep.last_accel - jlog.data[jlog.idx-1].a0);
+-                        jlog.data[jlog.idx].s = jerk_rampdown;
+-                        jlog.data[jlog.idx].t = time_to_jerk;
+-#endif
+-                        //Distance to 0 acceleration at speed (mm == V(0)*T + 1/2 A0*T^2 + 1/6 J*T^3)
+-                        if((mm_remaining - prep.accelerate_until) > jerk_rampdown) {
+-                            //+1.0f to avoid divide by 0 speed, minor effect on jerk ramp - ??
+-                            // Check if we are on ramp up or ramp down. Ramp down if distance to end of acceleration is less than distance needed to reach 0 acceleration.
+-                            // Then limit acceleration change by jerk up to max acceleration and update for next segment.
+-                            // Minimum acceleration jerk per time_var to ensure acceleration completes. Acceleration change at end of ramp is in acceptable jerk range.
+-                            prep.last_accel = min(prep.last_accel + accel_var, pl_block->max_acceleration);
+-                        } else {
++                        // Instantaneous accel: dv/T * P'(tau), P' = 30*tau^2*(1-tau)^2.
++                        float jlog_tt = prep.ramp_tau * (1.0f - prep.ramp_tau);
++                        jlog.data[jlog.idx].a0 = prep.ramp_t == 0.0f ? 0.0f
++                                               : 30.0f * (prep.ramp_v1 - prep.ramp_v0) / prep.ramp_t
++                                                 * jlog_tt * jlog_tt;
++                        jlog.data[jlog.idx].da = prep.ramp_tau;
++                        jlog.data[jlog.idx].s = prep.ramp_mm;
++                        jlog.data[jlog.idx].t = prep.ramp_t;
++#endif
++                        if(jerk_ramp_advance(&mm_remaining, &time_var, prep.accelerate_until, prep.maximum_speed)) {
++                            prep.ramp_type = mm_remaining == prep.decelerate_after ? Ramp_Decel : Ramp_Cruise;
+ #ifdef JERK_LOG
+-                            if(jlog.rd == 0) jlog.rd = jlog.idx;
+-                            jlog.data[jlog.idx].ramp_down = true;
++                            if(prep.ramp_type == Ramp_Decel) jlog.d = jlog.idx;
+ #endif
+-                            prep.last_accel = max(prep.last_accel - accel_var, accel_var);
+                         }
+-                        speed_var = prep.last_accel * time_var;
+-                    } else
++                        break;
++                    }
+ #endif // ENABLE_JERK_ACCELERATION
+                     speed_var = pl_block->acceleration * time_var;
+ 
+@@ -1188,14 +1330,6 @@
+                         time_var = 2.0f * (pl_block->millimeters - mm_remaining) / (prep.current_speed + prep.maximum_speed);
+                         prep.ramp_type = mm_remaining == prep.decelerate_after ? Ramp_Decel : Ramp_Cruise;
+                         prep.current_speed = prep.maximum_speed;
+-#if ENABLE_JERK_ACCELERATION
+-                        if(prep.jerk) {
+-                            prep.last_accel = 0.0f;  // reset acceleration variable to 0 for next accel ramp
+-#ifdef JERK_LOG
+-                            if(prep.ramp_type == Ramp_Decel) jlog.d = jlog.idx;
+-#endif
+-                        }
+-#endif // ENABLE_JERK_ACCELERATION
+                     } else // Acceleration only.
+                         prep.current_speed += speed_var;
+ #ifdef JERK_LOG
+@@ -1227,33 +1361,23 @@
+                     // NOTE: mm_var used as a misc worker variable to prevent errors when near zero speed.
+ #if ENABLE_JERK_ACCELERATION
+                     if(prep.jerk) {
+-                        float accel_var = pl_block->jerk * time_var; // Delta acceleration
+-                        float time_to_jerk = prep.last_accel == 0.0f ? accel_var : (prep.last_accel / pl_block->jerk);
+-                        float jerk_rampdown = prep.exit_speed +
+-                                               time_to_jerk * (prep.last_accel -
+-                                                               (0.5f * pl_block->jerk * time_to_jerk)); // Speedpoint to start ramping down deceleration. (V = a * t - 1/2 j * t^2)
+ #ifdef JERK_LOG
+-                        jlog.data[jlog.idx].s0 = prep.decelerate_after - mm_remaining;
++                        jlog.data[jlog.idx].s0 = prep.ramp_mm - (mm_remaining - prep.mm_complete);
+                         jlog.data[jlog.idx].v0 = prep.current_speed;
+-                        jlog.data[jlog.idx].a0 = prep.last_accel;
+-                        jlog.data[jlog.idx].da = jlog.idx == 0 ? prep.last_accel : (prep.last_accel - jlog.data[jlog.idx-1].a0);
+-                        jlog.data[jlog.idx].s = jerk_rampdown;
+-                        jlog.data[jlog.idx].t = time_to_jerk;
+-#endif
+-                        if(prep.current_speed > jerk_rampdown) {
+-                            // Check if we are on ramp up or ramp down. Ramp down if speed is less than speed needed for reaching 0 acceleration.
+-                            // Then limit acceleration change by jerk up to max acceleration and update for next segment.
+-                            // Minimum acceleration of jerk per time_var to ensure deceleration completes. Acceleration change at end of ramp is in acceptable jerk range.
+-                            prep.last_accel = min(prep.last_accel + accel_var, pl_block->max_acceleration);
+-                        } else {
+-#ifdef JERK_LOG
+-                            if(jlog.ru == 0) jlog.ru = jlog.idx;
+-                            jlog.data[jlog.idx].ramp_down = true;
+-#endif
+-                            prep.last_accel = max(prep.last_accel - accel_var, accel_var);
+-                        }
+-                        speed_var = prep.last_accel * time_var; // Used as delta speed (mm/min)
+-                    } else
++                        float jlog_tt = prep.ramp_tau * (1.0f - prep.ramp_tau);
++                        jlog.data[jlog.idx].a0 = prep.ramp_t == 0.0f ? 0.0f
++                                               : 30.0f * (prep.ramp_v1 - prep.ramp_v0) / prep.ramp_t
++                                                 * jlog_tt * jlog_tt;
++                        jlog.data[jlog.idx].da = prep.ramp_tau;
++                        jlog.data[jlog.idx].s = prep.ramp_mm;
++                        jlog.data[jlog.idx].t = prep.ramp_t;
++#endif
++                        // Ramp end is the end of the velocity profile (0.0 at end of block,
++                        // or the feed hold stop point mid-block). The do-while condition
++                        // terminates the segment loop once mm_complete is reached.
++                        jerk_ramp_advance(&mm_remaining, &time_var, prep.mm_complete, prep.exit_speed);
++                        break;
++                    }
+ #endif //ENABLE_JERK_ACCELERATION
+                     speed_var = pl_block->acceleration * time_var; // Used as delta speed (mm/min)
+ 
+@@ -1262,32 +1386,12 @@
+                         mm_var = mm_remaining - time_var * (prep.current_speed - 0.5f * speed_var); // (mm)
+                         if (mm_var > prep.mm_complete) {
+                             mm_remaining = mm_var;
+-                                prep.current_speed -= speed_var;
+-                        #if ENABLE_JERK_ACCELERATION
+-                            prep.last_time_var = time_var; // Store for final segment continuity.
+-                        #endif
++                            prep.current_speed -= speed_var;
+                             break;// Segment complete. Exit switch-case statement. Continue do-while loop.
+                         }
+                     }
+                     // Otherwise, at end of block or end of forced-deceleration.
+-// Otherwise, at end of block or end of forced-deceleration.
+-#if ENABLE_JERK_ACCELERATION
+-    if(prep.jerk) {
+-        // The trapezoidal formula (2*d / (v0+v1)) is numerically unstable under jerk-limited
+-        // motion when exit_speed approaches zero — denominator collapses and time_var blows up
+-        // by orders of magnitude, producing an erroneously long final segment.
+-        //
+-        // The S-curve is fully executed by this point. Use the duration of the last normal
+-        // segment to maintain step rate continuity into the final segment — no rate increase,
+-        // no snap, no drag. Position and exit_speed are snapped to correct values unconditionally
+-        // after this regardless of time_var.
+-        time_var = prep.last_time_var;
+-        prep.last_accel = 0.0f; // Reset for next block's acceleration ramp.
+-    } else
+-#endif
+-    time_var = 2.0f * (mm_remaining - prep.mm_complete) / (prep.current_speed + prep.exit_speed);
+-                
+-
++                    time_var = 2.0f * (mm_remaining - prep.mm_complete) / (prep.current_speed + prep.exit_speed);
+                     mm_remaining = prep.mm_complete;
+                     prep.current_speed = prep.exit_speed;
+             }

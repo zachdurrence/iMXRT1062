@@ -1,0 +1,74 @@
+########## QUINTIC BEZIER (new) ##########
+
+[1] full trapezoid F3000 100mm
+    a_eff=394822.2  profile ramp=0 accel_until=88.60246 decel_after=11.39754 max_v=3000.00 exit_v=0.00 mm_complete=0.00000
+    segs=905    peak|a|=740259    (82.3 % of A)   peak|dj| across segs=646246488    ( 2.15x J)
+    max inter-segment dv=62.271    mm/min   dist err=+9.313e-10 mm   exit v err=+0.000e+00 mm/min   dt range 2.5000-62.5000 ms
+    max dv on uniform 2.5ms segments = 30.844 mm/min  (this is the step-rate impulse the drives see)
+
+[2] triangle 3mm F3000
+    a_eff=394822.2  profile ramp=0 accel_until=1.50000 decel_after=1.50000 max_v=1088.33 exit_v=0.00 mm_complete=0.00000
+    segs=90     peak|a|=740084    (82.2 % of A)   peak|dj| across segs=2341760544   ( 7.81x J)
+    max inter-segment dv=103.510   mm/min   dist err=+0.000e+00 mm   exit v err=+0.000e+00 mm/min   dt range 2.5000-40.0000 ms
+    max dv on uniform 2.5ms segments = 30.837 mm/min  (this is the step-rate impulse the drives see)
+
+[3] accel only into next block
+    a_eff=394822.2  profile ramp=0 accel_until=8.60246 decel_after=0.00000 max_v=3000.00 exit_v=3000.00 mm_complete=0.00000
+    segs=213    peak|a|=740256    (82.3 % of A)   peak|dj| across segs=646246418    ( 2.15x J)
+    max inter-segment dv=62.272    mm/min   dist err=+0.000e+00 mm   exit v err=+0.000e+00 mm/min   dt range 0.4516-62.5000 ms
+    max dv on uniform 2.5ms segments = 30.844 mm/min  (this is the step-rate impulse the drives see)
+
+[4] decel to zero
+    a_eff=394822.2  profile ramp=1 accel_until=20.00000 decel_after=11.39754 max_v=3000.00 exit_v=0.00 mm_complete=0.00000
+    segs=213    peak|a|=740235    (82.2 % of A)   peak|dj| across segs=300093756    ( 1.00x J)
+    max inter-segment dv=44.245    mm/min   dist err=+4.657e-10 mm   exit v err=+0.000e+00 mm/min   dt range 2.5000-50.4516 ms
+    max dv on uniform 2.5ms segments = 30.843 mm/min  (this is the step-rate impulse the drives see)
+
+[5] decel to F800
+    a_eff=394822.2  profile ramp=1 accel_until=20.00000 decel_after=10.58704 max_v=3000.00 exit_v=800.00 mm_complete=0.00000
+    segs=210    peak|a|=740221    (82.2 % of A)   peak|dj| across segs=409359384    ( 1.36x J)
+    max inter-segment dv=30.843    mm/min   dist err=-1.281e-09 mm   exit v err=+0.000e+00 mm/min   dt range 0.0865-2.5000 ms
+    max dv on uniform 2.5ms segments = 30.843 mm/min  (this is the step-rate impulse the drives see)
+
+[6] cruise only
+    a_eff=394822.2  profile ramp=1 accel_until=50.00000 decel_after=0.00000 max_v=3000.00 exit_v=3000.00 mm_complete=0.00000
+    segs=400    peak|a|=0         (0.0  % of A)   peak|dj| across segs=0            ( 0.00x J)
+    max inter-segment dv=0.000     mm/min   dist err=+0.000e+00 mm   exit v err=+0.000e+00 mm/min   dt range 2.5000-2.5000 ms
+    max dv on uniform 2.5ms segments = 0.000 mm/min  (this is the step-rate impulse the drives see)
+
+[7] feed hold mid-block
+    a_eff=394822.2  profile ramp=2 accel_until=0.00000 decel_after=0.00000 max_v=0.00 exit_v=0.00 mm_complete=88.60246
+    segs=144    peak|a|=740256    (82.3 % of A)   peak|dj| across segs=299953131    ( 1.00x J)
+    max inter-segment dv=44.814    mm/min   dist err=+0.000e+00 mm   exit v err=+6.519e-02 mm/min   dt range 2.5000-45.0000 ms
+    max dv on uniform 2.5ms segments = 30.844 mm/min  (this is the step-rate impulse the drives see)
+
+[8] very slow F1
+    a_eff=7208.4    profile ramp=0 accel_until=0.99993 decel_after=0.00007 max_v=1.00 exit_v=0.00 mm_complete=0.00000
+    segs=64     peak|a|=75        (0.0  % of A)   peak|dj| across segs=5662         ( 0.00x J)
+    max inter-segment dv=1.000     mm/min   dist err=+0.000e+00 mm   exit v err=+0.000e+00 mm/min   dt range 797.3565-942.4963 ms
+    max dv on uniform 2.5ms segments = 0.000 mm/min  (this is the step-rate impulse the drives see)
+
+[9] tiny move 0.05mm
+    a_eff=394822.2  profile ramp=0 accel_until=0.02500 decel_after=0.02500 max_v=140.50 exit_v=0.00 mm_complete=0.00000
+    segs=4      peak|a|=583393    (64.8 % of A)   peak|dj| across segs=4914857596   (16.38x J)
+    max inter-segment dv=134.325   mm/min   dist err=-7.276e-10 mm   exit v err=+0.000e+00 mm/min   dt range 5.2037-17.5000 ms
+    max dv on uniform 2.5ms segments = 0.000 mm/min  (this is the step-rate impulse the drives see)
+
+[10] rapid F10000 200mm
+    a_eff=480000.0  profile ramp=0 accel_until=100.00000 decel_after=100.00000 max_v=9797.96 exit_v=0.00 mm_complete=0.00000
+    segs=845    peak|a|=899988    (100.0% of A)   peak|dj| across segs=197964848    ( 0.66x J)
+    max inter-segment dv=40.571    mm/min   dist err=+0.000e+00 mm   exit v err=+0.000e+00 mm/min   dt range 2.5000-95.0000 ms
+    max dv on uniform 2.5ms segments = 37.500 mm/min  (this is the step-rate impulse the drives see)
+
+[11] low jerk setting
+    a_eff=72084.3   profile ramp=0 accel_until=50.00000 decel_after=50.00000 max_v=2684.85 exit_v=0.00 mm_complete=0.00000
+    segs=1389   peak|a|=135158    (15.0 % of A)   peak|dj| across segs=18740941     ( 1.87x J)
+    max inter-segment dv=17.978    mm/min   dist err=+0.000e+00 mm   exit v err=+9.790e-02 mm/min   dt range 2.5000-205.0000 ms
+    max dv on uniform 2.5ms segments = 5.632 mm/min  (this is the step-rate impulse the drives see)
+
+[12] jog: linear path, jerk off
+    a_eff=900000.0  profile ramp=0 accel_until=95.00000 decel_after=5.00000 max_v=3000.00 exit_v=0.00 mm_complete=0.00000
+    segs=867    peak|a|=900055    (100.0% of A)   peak|dj| across segs=21600000463  (72.00x J)
+    max inter-segment dv=187.500   mm/min   dist err=-9.313e-10 mm   exit v err=+0.000e+00 mm/min   dt range 2.5000-12.5000 ms
+    max dv on uniform 2.5ms segments = 37.500 mm/min  (this is the step-rate impulse the drives see)
+

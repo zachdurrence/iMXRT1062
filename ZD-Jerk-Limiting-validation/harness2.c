@@ -14,6 +14,11 @@
 #include <math.h>
 
 #define ENABLE_JERK_ACCELERATION 1
+#ifndef JERK_LIMIT_SHORT_MOVES
+#define JERK_LIMIT_SHORT_MOVES 0
+#endif
+#include <stdint.h>
+typedef uint_fast8_t uf8;
 #define ACCELERATION_TICKS_PER_SECOND 400
 #define DT_SEGMENT (1.0f / (60.0f * (float)ACCELERATION_TICKS_PER_SECOND))
 #define REQ_MM_INCREMENT_SCALAR 1.25f
@@ -210,18 +215,20 @@ static void analyse (testcase_t *tc)
 int main (void)
 {
     testcase_t cases[] = {
-        { "full trapezoid F3000 100mm",  100.0f,    0.0f, 3000.0f,    0.0f, 900000.0f, 3.0e8f, false, true },
-        { "triangle 3mm F3000",            3.0f,    0.0f, 3000.0f,    0.0f, 900000.0f, 3.0e8f, false, true },
-        { "accel only into next block",   20.0f,    0.0f, 3000.0f, 3000.0f, 900000.0f, 3.0e8f, false, true },
-        { "decel to zero",                20.0f, 3000.0f, 3000.0f,    0.0f, 900000.0f, 3.0e8f, false, true },
-        { "decel to F800",                20.0f, 3000.0f, 3000.0f,  800.0f, 900000.0f, 3.0e8f, false, true },
-        { "cruise only",                  50.0f, 3000.0f, 3000.0f, 3000.0f, 900000.0f, 3.0e8f, false, true },
-        { "feed hold mid-block",         100.0f, 3000.0f, 3000.0f,    0.0f, 900000.0f, 3.0e8f, true,  true },
-        { "very slow F1",                  1.0f,    0.0f,    1.0f,    0.0f, 900000.0f, 3.0e8f, false, true },
-        { "tiny move 0.05mm",             0.05f,    0.0f, 3000.0f,    0.0f, 900000.0f, 3.0e8f, false, true },
-        { "rapid F10000 200mm",          200.0f,    0.0f,10000.0f,    0.0f, 900000.0f, 3.0e8f, false, true },
-        { "low jerk setting",            100.0f,    0.0f, 3000.0f,    0.0f, 900000.0f, 1.0e7f, false, true },
-        { "jog: linear path, jerk off",  100.0f,    0.0f, 3000.0f,    0.0f, 900000.0f, 3.0e8f, false, false },
+        { "XY F3000 100mm",              100.0f,    0.0f, 3000.0f,    0.0f, 2880000.0f, 6.48e8f, false, true },
+        { "XY F3000 3mm triangle",         3.0f,    0.0f, 3000.0f,    0.0f, 2880000.0f, 6.48e8f, false, true },
+        { "XY F3000 corner: decel to 2000",20.0f, 3000.0f, 3000.0f, 2000.0f, 2880000.0f, 6.48e8f, false, true },
+        { "XY rapid F20000 100mm",       100.0f,    0.0f,20000.0f,    0.0f, 2880000.0f, 6.48e8f, false, true },
+        { "XY rapid F20000 1mm hop",       1.0f,    0.0f,20000.0f,    0.0f, 2880000.0f, 6.48e8f, false, true },
+        /* arc-chord geometry: short block cruising through, dv ~ 0 -- the case
+           the clamp must NOT touch */
+        { "arc chord 0.1mm cruise",        0.1f, 2900.0f, 3000.0f, 2900.0f, 2880000.0f, 6.48e8f, false, true },
+        { "arc chord 0.05mm cruise",      0.05f, 2900.0f, 3000.0f, 2900.0f, 2880000.0f, 6.48e8f, false, true },
+        { "contour 0.5mm cruise",          0.5f, 2500.0f, 3000.0f, 2500.0f, 2880000.0f, 6.48e8f, false, true },
+        { "pure cruise 50mm",             50.0f, 3000.0f, 3000.0f, 3000.0f, 2880000.0f, 6.48e8f, false, true },
+        { "feed hold from rapid F20000", 400.0f,20000.0f,20000.0f,    0.0f, 2880000.0f, 6.48e8f, true,  true },
+        { "Z plunge F500 10mm",           10.0f,    0.0f,  500.0f,    0.0f, 2880000.0f, 6.48e8f, false, true },
+        { "jog F3000 (linear path)",     100.0f,    0.0f, 3000.0f,    0.0f, 2880000.0f, 6.48e8f, false, false },
     };
 
 #if ARM_NEW

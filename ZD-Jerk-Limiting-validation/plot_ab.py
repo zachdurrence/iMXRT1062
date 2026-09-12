@@ -59,5 +59,5 @@ fig.suptitle("grblHAL jerk-limited ramp: quantized-jerk integration vs closed-fo
              "(code extracted verbatim from stepper.c, run in float, ACCELERATION_TICKS_PER_SECOND=400)",
              fontsize=11)
 plt.tight_layout(rect=[0, 0, 1, 0.955])
-plt.savefig("/home/claude/quintic_ab_validation.png", dpi=140)
+plt.savefig("quintic_ab_validation.png", dpi=140)
 print("\nsaved quintic_ab_validation.png")

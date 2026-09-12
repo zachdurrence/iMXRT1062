@@ -1,5 +1,5 @@
---- /mnt/user-data/uploads/iMXRT1062/grblHAL_Teensy4/src/grbl/stepper.c	2026-09-12 19:25:37.206504618 +0000
-+++ work/stepper.c	2026-09-12 19:36:33.046480631 +0000
+--- a/stepper.c
++++ b/stepper.c
 @@ -102,9 +102,16 @@
      prep_flags_t recalculate;
      ramp_type_t ramp_type;      // Current segment ramp state

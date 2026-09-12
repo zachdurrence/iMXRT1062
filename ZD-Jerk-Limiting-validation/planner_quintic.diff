@@ -1,5 +1,5 @@
---- /mnt/user-data/uploads/iMXRT1062/grblHAL_Teensy4/src/grbl/planner.c	2026-09-12 19:25:36.742504635 +0000
-+++ work/planner.c	2026-09-12 19:42:36.566467336 +0000
+--- a/planner.c
++++ b/planner.c
 @@ -567,22 +567,85 @@
  
  #if ENABLE_JERK_ACCELERATION

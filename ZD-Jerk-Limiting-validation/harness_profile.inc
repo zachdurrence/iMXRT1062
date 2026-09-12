@@ -1,5 +1,8 @@
             prep.mm_complete = 0.0f; // Default velocity profile complete at 0.0mm from end of block.
-            float inv_2_accel = 0.5f / pl_block->acceleration;
+            // Acceleration used to lay out THIS block's profile. Normally the
+            // planner's value; the optional per-block jerk clamp may reduce it.
+            float block_accel = pl_block->acceleration;
+            float inv_2_accel = 0.5f / block_accel;
 
 #if ENABLE_JERK_ACCELERATION
             // Disarm any in-flight quintic ramp. This block runs both on a new
@@ -26,9 +29,6 @@
                     prep.exit_speed = 0.0f;
                 }
             } else { // [Normal Operation]
-                // Compute or recompute velocity profile parameters of the prepped planner block.
-                prep.ramp_type = Ramp_Accel; // Initialize as acceleration ramp.
-                prep.accelerate_until = pl_block->millimeters;
 
                 float exit_speed_sqr;
                 if (sys.step_control.execute_sys_motion)
@@ -40,9 +40,20 @@
 
                 float nominal_speed = plan_compute_profile_nominal_speed(pl_block);
                 float nominal_speed_sqr = nominal_speed * nominal_speed;
-                float intersect_distance = 0.5f * (pl_block->millimeters + inv_2_accel * (pl_block->entry_speed_sqr - exit_speed_sqr));
 
                 prep.target_feed = nominal_speed;
+
+#if ENABLE_JERK_ACCELERATION && JERK_LIMIT_SHORT_MOVES
+                uint_fast8_t jerk_pass = prep.jerk ? JERK_LIMIT_PASSES : 0;
+                bool clampable;
+              do {
+                clampable = false;
+#endif
+                // Compute or recompute velocity profile parameters of the prepped planner block.
+                prep.ramp_type = Ramp_Accel; // Initialize as acceleration ramp.
+                prep.accelerate_until = pl_block->millimeters;
+
+                float intersect_distance = 0.5f * (pl_block->millimeters + inv_2_accel * (pl_block->entry_speed_sqr - exit_speed_sqr));
 
                 if (pl_block->entry_speed_sqr > nominal_speed_sqr) { // Only occurs during override reductions.
 
@@ -54,7 +65,7 @@
                         // prep.maximum_speed = prep.current_speed;
 
                         // Compute override block exit speed since it doesn't match the planner exit speed.
-                        prep.exit_speed = sqrtf(pl_block->entry_speed_sqr - 2.0f * pl_block->acceleration * pl_block->millimeters);
+                        prep.exit_speed = sqrtf(pl_block->entry_speed_sqr - 2.0f * block_accel * pl_block->millimeters);
                         prep.recalculate.decel_override = On; // Flag to load next block as deceleration override.
 
                         // TODO: Determine correct handling of parameters in deceleration-only.
@@ -82,8 +93,15 @@
                             }
                         } else { // Triangle type
                             prep.accelerate_until = prep.decelerate_after = intersect_distance;
-                            prep.maximum_speed = sqrtf(2.0f * pl_block->acceleration * intersect_distance + exit_speed_sqr);
+                            prep.maximum_speed = sqrtf(2.0f * block_accel * intersect_distance + exit_speed_sqr);
                         }
+#if ENABLE_JERK_ACCELERATION && JERK_LIMIT_SHORT_MOVES
+                        // Trapezoid and triangle are the shapes the clamp may
+                        // reduce. Override reductions and deceleration-only
+                        // profiles are left alone -- their exit speed is a
+                        // contract with the next block.
+                        clampable = true;
+#endif
                     } else { // Deceleration-only type
                         prep.ramp_type = Ramp_Decel;
                         // prep.decelerate_after = pl_block->millimeters;
@@ -94,5 +112,37 @@
                     // prep.decelerate_after = 0.0f;
                     prep.maximum_speed = prep.exit_speed;
                 }
+#if ENABLE_JERK_ACCELERATION && JERK_LIMIT_SHORT_MOVES
+                if(jerk_pass == 0 || !clampable)
+                    break;
+
+                // Constrain the acceleration so both of this block's ramps stay
+                // inside pl_block->jerk, using their real geometry.
+                float limited = jerk_ramp_accel_limit(sqrtf(pl_block->entry_speed_sqr), prep.maximum_speed,
+                                                       pl_block->millimeters - prep.accelerate_until, block_accel);
+                limited = jerk_ramp_accel_limit(prep.maximum_speed, prep.exit_speed,
+                                                 prep.decelerate_after, limited);
+
+                if(limited >= block_accel)
+                    break; // Already compliant.
+
+                // Lowering the acceleration moves the accel/decel intersection.
+                // Far enough and the profile would flip to acceleration-only or
+                // deceleration-only, neither of which this clamp is allowed to
+                // produce (their speeds are a contract with the neighbouring
+                // blocks). Verify the shape survives BEFORE committing, so a
+                // rejected candidate leaves the current profile untouched.
+                float inv_2_limited = 0.5f / limited;
+                float intersect_limited = 0.5f * (pl_block->millimeters +
+                                                   inv_2_limited * (pl_block->entry_speed_sqr - exit_speed_sqr));
+
+                if(intersect_limited <= 0.0f || intersect_limited >= pl_block->millimeters)
+                    break;
+
+                block_accel = limited;
+                inv_2_accel = inv_2_limited;
+
+              } while(jerk_pass--);
+#endif
             }
 

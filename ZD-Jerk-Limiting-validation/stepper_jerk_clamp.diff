@@ -1,0 +1,223 @@
+--- a/stepper.c
++++ b/stepper.c
+@@ -192,6 +192,32 @@
+ 
+ #if ENABLE_JERK_ACCELERATION
+ 
++// Peak jerk of the quintic ramp is (10/sqrt 3) * dv/T^2. Exact; see the
++// derivation in the ramp comment below and in plan_buffer_line().
++#define JERK_QUINTIC_FACTOR 5.7735026919f
++
++// Opt-in per-block jerk clamp for short moves. Off by default: it closes a real
++// gap but costs feed rate on the moves it touches, and how much that matters
++// depends on the toolpath. See the block comment on jerk_ramp_accel_limit().
++#ifndef JERK_LIMIT_SHORT_MOVES
++#define JERK_LIMIT_SHORT_MOVES 0
++#endif
++
++// Minimum ramp length, in DT_SEGMENT ticks, for the clamp to consider a ramp's
++// jerk physically meaningful rather than segment quantization.
++#ifndef JERK_LIMIT_MIN_TICKS
++#define JERK_LIMIT_MIN_TICKS 4
++#endif
++
++// Fixed-point iterations for the clamp. On a triangle the peak speed depends on
++// the acceleration that the clamp is solving for, so the profile is recomputed.
++// Measured convergence on the worst case (a 1 mm rapid, 16.3x over): 1.04x the
++// jerk limit after 3 passes, 1.00x after 5. Only blocks that actually clamp pay
++// for the extra passes.
++#ifndef JERK_LIMIT_PASSES
++#define JERK_LIMIT_PASSES 5
++#endif
++
+ /*  QUINTIC (S-CURVE) JERK-LIMITED RAMP
+     ---------------------------------------------------------------------------
+     Replaces the per-segment quantized jerk integration previously used here
+@@ -316,6 +342,77 @@
+     return true;
+ }
+ 
++#if JERK_LIMIT_SHORT_MOVES
++
++/*  PER-BLOCK JERK CLAMP
++    ---------------------------------------------------------------------------
++    plan_buffer_line() sizes the block's acceleration from programmed_rate,
++    because entry and exit speeds are not known until the lookahead passes have
++    run. Peak jerk goes as
++
++        j = JERK_QUINTIC_FACTOR * a^2 / dv
++
++    so a block whose ACTUAL speed change is smaller than programmed_rate exceeds
++    the jerk setting by programmed_rate/dv. Measured before this clamp: 2.3x on a
++    3 mm move at F3000, 12.5x at 0.1 mm, 16.3x on a 1 mm rapid.
++
++    Note the sign. Lowering peak SPEED shortens the ramp and makes jerk worse --
++    T = dv/a, so j rises as dv falls. The lever is acceleration, and it enters
++    squared. Inverting the relation above gives the fix:
++
++        a <= sqrt(J * dv / JERK_QUINTIC_FACTOR)
++
++    which is exactly the planner's own second bound, evaluated with the block's
++    real dv instead of programmed_rate. By profile-setup time the stepper knows
++    that dv, so the correction belongs here and not in the planner -- applying it
++    to the lookahead's entry-speed limits instead throttles every short block
++    whether or not it ramps, and collapses arc feed rates to 0.27-0.34x.
++
++    Applied per block against the real geometry it leaves chained short blocks
++    completely alone (0 of 200 and 0 of 400 arc chords clamped in simulation),
++    because arc chords cruise: dv per block is ~0 and there is no ramp to clamp.
++
++    Only ramps spanning at least JERK_LIMIT_MIN_TICKS segments are considered. A
++    shorter ramp is delivered by the segment generator as one or two velocity
++    steps, so its apparent jerk is DT_SEGMENT quantization rather than curve
++    shape; no acceleration change can affect it, and clamping on account of it
++    would spend feed rate for nothing.
++
++    NOT applied to feed holds, which keep the planner's acceleration so that
++    stopping distance is not extended, nor to override-reduction profiles, whose
++    exit speed is a contract with the next block.
++
++    COST: real, and paid only by short isolated moves. The clamp is exact --
++    bisection against this bound reproduces the closed form (J*sqrt(L)/JF)^(2/3)
++    for a symmetric triangle to within float epsilon -- so what it costs is
++    simply what the jerk limit costs. At the shipped settings the threshold is
++    around 15 mm; below that, feed rate falls as the move shortens.
++*/
++static float jerk_ramp_accel_limit (float v0, float v1, float mm, float accel)
++{
++    float vsum = v0 + v1;
++
++    if(mm <= 0.0f || vsum <= 0.0f)
++        return accel;
++
++    float t = 2.0f * mm / vsum;
++
++    // Sub-resolution ramp: a step, not a curve. Quantization, not jerk.
++    if(t < (float)JERK_LIMIT_MIN_TICKS * DT_SEGMENT)
++        return accel;
++
++    float dv = v1 > v0 ? v1 - v0 : v0 - v1;
++
++    if(JERK_QUINTIC_FACTOR * dv <= pl_block->jerk * t * t)
++        return accel; // Already within the jerk limit.
++
++    float limit = sqrtf(pl_block->jerk * dv * (1.0f / JERK_QUINTIC_FACTOR));
++
++    return limit < accel ? limit : accel;
++}
++
++#endif // JERK_LIMIT_SHORT_MOVES
++
+ #endif // ENABLE_JERK_ACCELERATION
+ 
+ /*    BLOCK VELOCITY PROFILE DEFINITION
+@@ -1128,7 +1225,10 @@
+              hold, override the planner velocities and decelerate to the target exit speed.
+             */
+             prep.mm_complete = 0.0f; // Default velocity profile complete at 0.0mm from end of block.
+-            float inv_2_accel = 0.5f / pl_block->acceleration;
++            // Acceleration used to lay out THIS block's profile. Normally the
++            // planner's value; the optional per-block jerk clamp may reduce it.
++            float block_accel = pl_block->acceleration;
++            float inv_2_accel = 0.5f / block_accel;
+ 
+ #if ENABLE_JERK_ACCELERATION
+             // Disarm any in-flight quintic ramp. This block runs both on a new
+@@ -1155,9 +1255,6 @@
+                     prep.exit_speed = 0.0f;
+                 }
+             } else { // [Normal Operation]
+-                // Compute or recompute velocity profile parameters of the prepped planner block.
+-                prep.ramp_type = Ramp_Accel; // Initialize as acceleration ramp.
+-                prep.accelerate_until = pl_block->millimeters;
+ 
+                 float exit_speed_sqr;
+                 if (sys.step_control.execute_sys_motion)
+@@ -1169,10 +1266,21 @@
+ 
+                 float nominal_speed = plan_compute_profile_nominal_speed(pl_block);
+                 float nominal_speed_sqr = nominal_speed * nominal_speed;
+-                float intersect_distance = 0.5f * (pl_block->millimeters + inv_2_accel * (pl_block->entry_speed_sqr - exit_speed_sqr));
+ 
+                 prep.target_feed = nominal_speed;
+ 
++#if ENABLE_JERK_ACCELERATION && JERK_LIMIT_SHORT_MOVES
++                uint_fast8_t jerk_pass = prep.jerk ? JERK_LIMIT_PASSES : 0;
++                bool clampable;
++              do {
++                clampable = false;
++#endif
++                // Compute or recompute velocity profile parameters of the prepped planner block.
++                prep.ramp_type = Ramp_Accel; // Initialize as acceleration ramp.
++                prep.accelerate_until = pl_block->millimeters;
++
++                float intersect_distance = 0.5f * (pl_block->millimeters + inv_2_accel * (pl_block->entry_speed_sqr - exit_speed_sqr));
++
+                 if (pl_block->entry_speed_sqr > nominal_speed_sqr) { // Only occurs during override reductions.
+ 
+                     prep.accelerate_until = pl_block->millimeters - inv_2_accel * (pl_block->entry_speed_sqr - nominal_speed_sqr);
+@@ -1183,7 +1291,7 @@
+                         // prep.maximum_speed = prep.current_speed;
+ 
+                         // Compute override block exit speed since it doesn't match the planner exit speed.
+-                        prep.exit_speed = sqrtf(pl_block->entry_speed_sqr - 2.0f * pl_block->acceleration * pl_block->millimeters);
++                        prep.exit_speed = sqrtf(pl_block->entry_speed_sqr - 2.0f * block_accel * pl_block->millimeters);
+                         prep.recalculate.decel_override = On; // Flag to load next block as deceleration override.
+ 
+                         // TODO: Determine correct handling of parameters in deceleration-only.
+@@ -1211,8 +1319,15 @@
+                             }
+                         } else { // Triangle type
+                             prep.accelerate_until = prep.decelerate_after = intersect_distance;
+-                            prep.maximum_speed = sqrtf(2.0f * pl_block->acceleration * intersect_distance + exit_speed_sqr);
++                            prep.maximum_speed = sqrtf(2.0f * block_accel * intersect_distance + exit_speed_sqr);
+                         }
++#if ENABLE_JERK_ACCELERATION && JERK_LIMIT_SHORT_MOVES
++                        // Trapezoid and triangle are the shapes the clamp may
++                        // reduce. Override reductions and deceleration-only
++                        // profiles are left alone -- their exit speed is a
++                        // contract with the next block.
++                        clampable = true;
++#endif
+                     } else { // Deceleration-only type
+                         prep.ramp_type = Ramp_Decel;
+                         // prep.decelerate_after = pl_block->millimeters;
+@@ -1223,6 +1338,38 @@
+                     // prep.decelerate_after = 0.0f;
+                     prep.maximum_speed = prep.exit_speed;
+                 }
++#if ENABLE_JERK_ACCELERATION && JERK_LIMIT_SHORT_MOVES
++                if(jerk_pass == 0 || !clampable)
++                    break;
++
++                // Constrain the acceleration so both of this block's ramps stay
++                // inside pl_block->jerk, using their real geometry.
++                float limited = jerk_ramp_accel_limit(sqrtf(pl_block->entry_speed_sqr), prep.maximum_speed,
++                                                       pl_block->millimeters - prep.accelerate_until, block_accel);
++                limited = jerk_ramp_accel_limit(prep.maximum_speed, prep.exit_speed,
++                                                 prep.decelerate_after, limited);
++
++                if(limited >= block_accel)
++                    break; // Already compliant.
++
++                // Lowering the acceleration moves the accel/decel intersection.
++                // Far enough and the profile would flip to acceleration-only or
++                // deceleration-only, neither of which this clamp is allowed to
++                // produce (their speeds are a contract with the neighbouring
++                // blocks). Verify the shape survives BEFORE committing, so a
++                // rejected candidate leaves the current profile untouched.
++                float inv_2_limited = 0.5f / limited;
++                float intersect_limited = 0.5f * (pl_block->millimeters +
++                                                   inv_2_limited * (pl_block->entry_speed_sqr - exit_speed_sqr));
++
++                if(intersect_limited <= 0.0f || intersect_limited >= pl_block->millimeters)
++                    break;
++
++                block_accel = limited;
++                inv_2_accel = inv_2_limited;
++
++              } while(jerk_pass--);
++#endif
+             }
+ 
+             if(state_get() != STATE_HOMING)

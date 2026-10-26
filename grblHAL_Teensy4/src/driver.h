@@ -30,6 +30,22 @@
 #include "core_pins.h"
 #include "pins_arduino.h"
 
+// The Teensy core does not declare the CMSIS PRIMASK accessors used by the nested
+// IRQ disable/enable code in driver.c and uart.c. Provide them unless CMSIS is present.
+#ifndef __CMSIS_GCC_H
+__attribute__((always_inline)) static inline uint32_t __get_PRIMASK (void)
+{
+    uint32_t result;
+    __asm volatile ("MRS %0, primask" : "=r" (result));
+    return result;
+}
+
+__attribute__((always_inline)) static inline void __set_PRIMASK (uint32_t priMask)
+{
+    __asm volatile ("MSR primask, %0" : : "r" (priMask) : "memory");
+}
+#endif
+
 #ifndef OVERRIDE_MY_MACHINE
 #include "my_machine.h"
 #endif

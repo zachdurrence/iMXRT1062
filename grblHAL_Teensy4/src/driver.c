@@ -671,7 +671,7 @@ static void driver_delay_ms (uint32_t ms, delay_callback_ptr callback)
         grbl_delay.ms = ms;
         if(!(grbl_delay.callback = callback)) {
             while(grbl_delay.ms)
-                grbl.on_execute_delay(state_get());
+                task_execute(true);
         }
     } else {
         if(grbl_delay.ms) {
@@ -2213,14 +2213,14 @@ static spindle_data_t *spindleGetData (spindle_data_request_t request)
     uint32_t pulse_length, rpm_timer_delta;
     spindle_encoder_counter_t encoder;
 
-    __disable_irq();
+    disable_irq();
 
     memcpy(&encoder, &spindle_encoder.counter, sizeof(spindle_encoder_counter_t));
 
     pulse_length = spindle_encoder.timer.pulse_length / spindle_encoder.tics_per_irq;
     rpm_timer_delta = GPT1_CNT - spindle_encoder.timer.last_pulse;
 
-    __enable_irq();
+    enable_irq();
 
     // If no (4) spindle pulses during last 250 ms assume RPM is 0
     if((stopped = ((pulse_length == 0) || (rpm_timer_delta > spindle_encoder.maximum_tt)))) {
@@ -2337,6 +2337,8 @@ static coolant_state_t coolantGetState (void)
     return state;
 }
 
+#ifdef WEB_BUILD
+
 // Helper functions for setting/clearing/inverting individual bits atomically (uninterruptable)
 static void bitsSetAtomic (volatile uint_fast16_t *ptr, uint_fast16_t bits)
 {
@@ -2374,6 +2376,63 @@ static void disable_irq (void)
 {
     __disable_irq();
 }
+
+#else
+
+static volatile uint32_t lock;
+
+static void disable_irq (void)
+{
+    if(!__get_PRIMASK() || lock) {
+        lock++;
+        __disable_irq();
+    }
+}
+
+static void enable_irq (void)
+{
+    if(lock && !--lock)
+        __enable_irq();
+}
+
+// Helper functions for setting/clearing/inverting individual bits atomically (uninterruptable)
+static void bitsSetAtomic (volatile uint_fast16_t *ptr, uint_fast16_t bits)
+{
+    uint32_t irq = __get_PRIMASK();
+    __set_PRIMASK(1);
+
+    *ptr |= bits;
+
+    __set_PRIMASK(irq);
+}
+
+static uint_fast16_t bitsClearAtomic (volatile uint_fast16_t *ptr, uint_fast16_t bits)
+{
+    uint32_t irq = __get_PRIMASK();
+    __set_PRIMASK(1);
+
+    uint_fast16_t prev = *ptr;
+    *ptr &= ~bits;
+
+    __set_PRIMASK(irq);
+
+    return prev;
+}
+
+static uint_fast16_t valueSetAtomic (volatile uint_fast16_t *ptr, uint_fast16_t value)
+{
+    uint32_t irq = __get_PRIMASK();
+    __set_PRIMASK(1);
+
+    uint_fast16_t prev = *ptr;
+    *ptr = value;
+
+    __set_PRIMASK(irq);;
+
+    return prev;
+}
+
+#endif
 
 // Configures perhipherals when settings are initialized or changed
 FLASHMEM static void on_settings_changed (settings_t *settings, settings_changed_flags_t changed)
@@ -3054,7 +3113,7 @@ FLASHMEM bool driver_init (void)
         options[strlen(options) - 1] = '\0';
 
     hal.info = "iMXRT1062";
-    hal.driver_version = "260616";
+    hal.driver_version = "261007";
     hal.driver_url = GRBL_URL "/iMXRT1062";
 #ifdef BOARD_NAME
     hal.board = BOARD_NAME;
@@ -3151,7 +3210,6 @@ FLASHMEM bool driver_init (void)
 #endif
     hal.driver_cap.software_debounce = On;
     hal.driver_cap.step_pulse_delay = On;
-    hal.driver_cap.amass_level = 3;
     hal.driver_cap.control_pull_up = On;
     hal.driver_cap.limits_pull_up = On;
     hal.driver_cap.probe_pull_up = On;
@@ -3225,7 +3283,8 @@ FLASHMEM bool driver_init (void)
     aux_ctrl_claim_out_ports(aux_out_claim_explicit, NULL);
 
     PROGMEM static const sys_command_t boot_command_list[] = {
-        {"BL", enter_bootloader, { .allow_blocking = On, .noargs = On }, { .str = "enter bootloader" } },
+        { "BL", enter_bootloader, { .allow_blocking = On, .noargs = On }, { .str = "enter bootloader" } },
+        { "BOOTLOADER", enter_bootloader, { .allow_blocking = On, .noargs = On }, { .str = "enter bootloader" } }
     };
 
     static sys_commands_t boot_commands = {
